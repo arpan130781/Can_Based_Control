@@ -1,0 +1,905 @@
+/*
+  encoder.c - quadrature encoder plugin
+
+  Part of grblHAL
+
+  Copyright (c) 2020-2026 Terje Io
+
+  grblHAL is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  grblHAL is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with grblHAL. If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include "driver.h"
+
+#if ENCODER_ENABLE == 1 ||  ENCODER_ENABLE == 2
+
+#include <math.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "grbl/grbl.h"
+#include "grbl/report.h"
+#include "grbl/protocol.h"
+#include "grbl/nvs_buffer.h"
+#include "grbl/task.h"
+#include "grbl/encoders.h"
+#include "grbl/state_machine.h"
+
+#define MIN(a, b) (((a) > (b)) ? (b) : (a))
+#define QEI_VELOCITY_TIMEOUT 100
+
+typedef bool (*mpg_algo_ptr)(sys_state_t state, axes_signals_t axes);
+
+typedef enum {
+    Encoder_Universal = 0,
+    Encoder_FeedRate,
+    Encoder_RapidRate,
+    Encoder_Spindle_RPM,
+    Encoder_MPG,
+    Encoder_MPG_X,
+    Encoder_MPG_Y,
+    Encoder_MPG_Z,
+    Encoder_MPG_A,
+    Encoder_MPG_B,
+    Encoder_MPG_C,
+    Encoder_MPG_U,
+    Encoder_MPG_V,
+    Encoder_MPG_W,
+    Encoder_Spindle_Position
+} encoder_mode_t;
+
+typedef union {
+    uint8_t flags;
+    uint8_t value;
+    struct {
+        uint8_t single_count_per_detent :1;
+    };
+} encoder_flags_t;
+
+typedef struct {
+    encoder_mode_t mode;
+    uint32_t cpr;               //!< Count per revolution.
+    uint32_t cpd;               //!< Count per detent.
+    uint32_t dbl_click_window;  //!< ms.
+    encoder_flags_t flags;
+} encoder_settings_t;
+
+typedef union {
+    uint8_t events;
+    struct {
+        uint8_t position_changed :1,
+                zero             :1,
+                lock             :1,
+                reset            :1,
+                scale            :1,
+                stop             :1,
+                unused           :2;
+    };
+} mpg_event_t;
+
+typedef union {
+    uint8_t all;
+    struct {
+        uint8_t moving  :1,
+                zero    :1,
+                lock    :1,
+                reset   :1,
+                unused  :4;
+    };
+} mpg_flags_t;
+
+typedef struct {
+    encoder_t *encoder;
+    int32_t npos;
+    encoder_mode_t mode;
+    uint_fast8_t id;
+    uint_fast8_t axis;          //!< Axis index for MPG encoders, 0xFF for others.
+    int32_t position;
+    uint32_t velocity;
+    encoder_settings_t *settings;
+} my_encoder_t;
+
+typedef struct {
+    int32_t position;
+    mpg_event_t event;
+    mpg_flags_t flags;
+    uint32_t next_event;
+    float pos;
+    float scale_factor;
+    my_encoder_t *enc;
+    mpg_algo_ptr handler;
+} mpg_t;
+
+static my_encoder_t enc[QEI_ENABLE] = {0};
+static char gcode[50];
+static mpg_t mpg[N_AXIS] = {0};
+static mpg_event_t mpg_events[N_AXIS] = {0};
+static axes_signals_t mpg_event = {0};
+static volatile bool mpg_spin_lock = false;
+static bool has_mpg_encoder = false;
+static my_encoder_t *override_encoder = NULL; // NULL when no Encoder_Universal available
+static nvs_address_t nvs_address;
+static encoder_settings_t encoders[QEI_ENABLE];
+static uint_fast8_t n_encoder = 0;
+
+static on_realtime_report_ptr on_realtime_report = NULL;
+static on_report_options_ptr on_report_options;
+
+static char *append (char *s)
+{
+    while(*s)
+        s++;
+
+    return s;
+}
+
+// MPG encoder movement algorithms
+// Bind the one to use to the axis MPGs at end of encoder_init(), later this will be made configurable (per axis?)
+
+static bool mpg_move_absolute (sys_state_t state, axes_signals_t axes)
+{
+    static bool is_moving = false;
+
+    int32_t delta;
+    uint32_t velocity = 0;
+    uint_fast8_t idx = 0;
+
+    strcpy(gcode, "G1");
+
+    while(axes.mask) {
+
+        if(axes.mask & 0x01) {
+            if((delta = mpg[idx].position - mpg[idx].enc->npos) != 0) {
+                float pos_delta = (float)delta * mpg[idx].scale_factor / 100.0f;
+                mpg[idx].position = enc->npos;
+                velocity = velocity == 0 ? enc->velocity : MIN(enc->velocity, velocity);
+                if(!gc_state.modal.distance_incremental)
+                    mpg[idx].pos += pos_delta;
+                velocity = velocity == 0 ? enc->velocity : MIN(enc->velocity, velocity);
+                sprintf(append(gcode), "%s%.3f", axis_letter[idx], gc_state.modal.distance_incremental ? pos_delta : mpg[idx].pos);
+            }
+        }
+
+        idx++;
+        axes.mask >>= 1;
+    }
+
+    if(strlen(gcode) > 2 && velocity > 0) {
+
+        sprintf(append(gcode), "F%lu", velocity);
+
+        is_moving = grbl.enqueue_gcode(gcode);
+#ifdef UART_DEBUG
+serialWriteS(gcode);
+serialWriteS(" ");
+serialWriteS(uitoa(is_moving));
+serialWriteS(" ");
+serialWriteS(uitoa(delta));
+serialWriteS(ASCII_EOL);
+#endif
+    }
+
+    return is_moving;
+}
+
+static bool mpg_jog_relative (sys_state_t state, axes_signals_t axes)
+{
+    static bool is_moving = false;
+
+    int32_t delta;
+    uint32_t velocity = 0;
+    uint_fast8_t idx = 0;
+
+    strcpy(gcode, "$J=G91");
+
+//   serialWriteS(uitoa(mpg[idx].encoder->position));
+//   serialWriteS(ASCII_EOL);
+
+    while(axes.mask) {
+
+        if(axes.mask & 0x01) {
+            if((delta = mpg[idx].position - mpg[idx].enc->npos) != 0) {
+                float pos_delta = (float)delta * mpg[idx].scale_factor / 100.0f;
+                mpg[idx].position = mpg[idx].enc->npos;
+                velocity = velocity == 0 ? enc->velocity : MIN(enc->velocity, velocity);
+                sprintf(append(gcode), "%s%.3f", axis_letter[idx], pos_delta);
+            }
+        }
+
+        idx++;
+        axes.mask >>= 1;
+    }
+
+    if(strlen(gcode) > 6 && velocity > 0) {
+
+        sprintf(append(gcode), "F%lu", velocity);
+
+        is_moving = grbl.enqueue_gcode(gcode);
+
+#ifdef UART_DEBUG
+serialWriteS(gcode);
+serialWriteS(" ");
+serialWriteS(uitoa(is_moving));
+serialWriteS(ASCII_EOL);
+#endif
+/*
+serialWriteS(itoa(npos[mpg[idx].encoder->id], gcode, 10));
+serialWriteS(ASCII_EOL);
+*/
+    }
+
+    return is_moving;
+}
+
+// End MPG encoder movement algorithms
+
+static inline void reset_override (encoder_mode_t mode)
+{
+    switch(mode) {
+
+        case Encoder_FeedRate:
+            grbl.enqueue_realtime_command(CMD_OVERRIDE_FEED_RESET);
+            break;
+
+        case Encoder_RapidRate:
+            grbl.enqueue_realtime_command(CMD_OVERRIDE_RAPID_RESET);
+            break;
+
+        case Encoder_Spindle_RPM:
+            grbl.enqueue_realtime_command(CMD_OVERRIDE_SPINDLE_RESET);
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void encoder_report_mode (void *data)
+{
+    if(override_encoder) {
+
+        switch(override_encoder->settings->mode) {
+
+            case Encoder_FeedRate:
+                hal.stream.write("[MSG:Encoder mode feed rate]" ASCII_EOL);
+                break;
+
+            case Encoder_RapidRate:
+                hal.stream.write("[MSG:Encoder mode rapid rate]" ASCII_EOL);
+                break;
+
+            case Encoder_Spindle_RPM:
+                hal.stream.write("[MSG:Encoder mode spindle RPM]" ASCII_EOL);
+                break;
+
+            default:
+                break;
+        }
+    }
+}
+
+static void encoder_poll (void *data)
+{
+    sys_state_t state = state_get();
+
+    if(mpg_event.mask && (state == STATE_IDLE || (state & STATE_JOG))) {
+
+        bool move_action = false, stop_action = false;
+        uint_fast8_t idx = 0;
+
+        axes_signals_t event, axes;
+
+#ifdef UART_DEBUG
+        serialWriteS("+");
+#endif
+
+        while(mpg_spin_lock);
+
+        event.mask = axes.mask = mpg_event.mask;
+
+        mpg_event.mask = 0;
+        for(idx = 0; idx < N_AXIS; idx++)
+            mpg_events[idx].events = mpg[idx].event.events;
+
+        idx = 0;
+
+        while(event.mask) {
+
+            if(event.mask & 0x01) {
+
+                if(mpg_events[idx].zero) {
+                    strcpy(gcode, "G90G10L20P0");
+                    strcat(gcode, axis_letter[idx]);
+                    strcat(gcode, "0");
+                    if(grbl.enqueue_gcode(gcode)) {
+                        mpg[idx].event.zero = Off;
+                        mpg[idx].position = mpg[idx].enc->npos = 0;
+                        mpg[idx].enc->encoder->reset(mpg[idx].enc->encoder);
+                    }
+                }
+
+                if(mpg_events[idx].scale) {
+                    mpg[idx].scale_factor *= 10.0f;
+                    if(mpg[idx].scale_factor > 100.0f)
+                        mpg[idx].scale_factor = 1.0f;
+#ifdef UART_DEBUG
+serialWriteS("Distance scale: ");
+serialWriteS(ftoa(mpg[idx].scale_factor, 0));
+serialWriteS(ASCII_EOL);
+#endif
+                }
+
+                if(mpg_events[idx].stop) {
+                    if((stop_action = mpg[idx].flags.moving && (state & STATE_JOG))) {
+                        grbl.enqueue_realtime_command(CMD_JOG_CANCEL);
+#ifdef UART_DEBUG
+serialWriteS("Jog cancel");
+serialWriteS(ASCII_EOL);
+#endif
+                    }
+                    mpg[idx].flags.moving = mpg_events[idx].position_changed = Off;
+                }
+
+                if(mpg_events[idx].position_changed) {
+
+                    if(!mpg[idx].flags.moving) {
+                        float target[N_AXIS];
+                        system_convert_array_steps_to_mpos(target, sys.position);
+                        mpg[idx].flags.moving = On;
+                        mpg[idx].pos = target[idx] - gc_get_offset(idx, false);
+                    }
+
+                    move_action = true;
+
+                    mpg[idx].flags.moving = On;
+                    mpg[idx].next_event += 100;
+                }
+            }
+
+            mpg[idx].event.events = 0;
+
+            idx++;
+            event.mask >>= 1;
+        }
+
+        if(move_action && !mpg[0].handler(state, axes))
+            mpg_event.mask |= 0; //axes.mask; // gcode was rejected, restore events
+    }
+}
+
+static void encoder_event (encoder_t *encoder, encoder_event_t *events, void *context)
+{
+    bool update_position = false;
+
+    my_encoder_t *enc = (my_encoder_t *)context;
+    encoder_event_t event = *events;
+
+    events->value = 0;
+
+    if(event.click) {
+
+        if(enc->settings->mode == Encoder_Universal) {
+            event.click = Off;
+            report_add_realtime(Report_Encoder);
+            enc->mode = enc->mode == Encoder_FeedRate ? Encoder_RapidRate : (enc->mode == Encoder_RapidRate ? Encoder_Spindle_RPM : Encoder_FeedRate);
+            task_add_immediate(encoder_report_mode, NULL); // Output mode change message from foreground process.
+        } else if(enc->settings->mode == Encoder_MPG) {
+            event.click = Off;
+            if(++enc->axis == N_AXIS)
+                enc->axis = X_AXIS;
+            mpg[enc->axis].position = enc->npos = enc->position = 0;
+            mpg[enc->axis].event.events = 0;
+            encoder->reset(encoder);
+        }
+    }
+
+    if(event.position_changed) {
+
+#ifdef UART_DEBUG
+        itoa(position, gcode, 10);
+        serialWriteS("Pos: ");
+        serialWriteS(gcode);
+        serialWriteS(ASCII_EOL);
+#endif
+        encoder_data_t *data = encoder->get_data(encoder);
+
+        int32_t position, n_count = ((position = data->position) * 100L) / (int32_t)enc->settings->cpr;
+
+        event.position_changed = Off;
+
+        if(n_count != enc->npos || data->velocity == 0) switch(enc->mode) {
+
+            case Encoder_FeedRate:
+                update_position = true;
+                if(n_count < enc->npos) {
+                    while(enc->npos-- != n_count)
+                        grbl.enqueue_realtime_command(CMD_OVERRIDE_FEED_FINE_MINUS);
+                } else {
+                    while(enc->npos++ != n_count)
+                        grbl.enqueue_realtime_command(CMD_OVERRIDE_FEED_FINE_PLUS);
+                }
+                break;
+
+            case Encoder_RapidRate:
+                update_position = abs(position - enc->position) >= enc->settings->cpd;
+
+                if(update_position) switch(sys.override.rapid_rate) {
+
+                    case DEFAULT_RAPID_OVERRIDE:
+                        if(position < enc->position)
+                            grbl.enqueue_realtime_command(CMD_OVERRIDE_RAPID_MEDIUM);
+                        break;
+
+                    case RAPID_OVERRIDE_MEDIUM:
+                        if(position < enc->position)
+                            grbl.enqueue_realtime_command(CMD_OVERRIDE_RAPID_LOW);
+                        else
+                            grbl.enqueue_realtime_command(CMD_OVERRIDE_RAPID_RESET);
+                        break;
+
+                    case RAPID_OVERRIDE_LOW:
+                        if(position > enc->position)
+                            grbl.enqueue_realtime_command(CMD_OVERRIDE_RAPID_MEDIUM);
+                        break;
+
+                    default:
+                        break;
+                }
+                break;
+
+            case Encoder_Spindle_RPM:
+                update_position = true;
+                if(n_count < enc->npos) {
+                    while(enc->npos-- != n_count)
+                        grbl.enqueue_realtime_command(CMD_OVERRIDE_SPINDLE_FINE_MINUS);
+                } else {
+                    while(enc->npos++ != n_count)
+                        grbl.enqueue_realtime_command(CMD_OVERRIDE_SPINDLE_FINE_PLUS);
+                }
+                break;
+
+            case Encoder_MPG:
+            case Encoder_MPG_X:
+            case Encoder_MPG_Y:
+            case Encoder_MPG_Z:
+#ifdef A_AXIS
+            case Encoder_MPG_A:
+#endif
+#ifdef B_AXIS
+            case Encoder_MPG_B:
+#endif
+#ifdef C_AXIS
+            case Encoder_MPG_C:
+#endif
+#ifdef U_AXIS
+            case Encoder_MPG_U:
+#endif
+#ifdef V_AXIS
+            case Encoder_MPG_V:
+#endif
+#ifdef W_AXIS
+            case Encoder_MPG_W:
+#endif
+                update_position = true;
+
+                mpg_spin_lock = true;
+                if(enc->velocity == 0) {
+                    mpg[enc->axis].event.stop = On; // mpg[enc->axis].flags.moving;
+                    mpg_event.mask |= (1 << enc->axis);
+                } else {
+                    mpg[enc->axis].event.position_changed = On;
+                    mpg_event.mask |= (1 << enc->axis);
+                }
+                mpg_spin_lock = false;
+                break;
+
+            default:
+                break;
+        }
+
+        if(update_position) {
+            enc->position = position;
+            enc->npos = n_count;
+        }
+    }
+
+    if(event.events) switch(enc->mode) {
+
+        case Encoder_FeedRate:
+        case Encoder_RapidRate:
+        case Encoder_Spindle_RPM:
+            if(event.dbl_click) {
+                enc->npos = 0;
+                encoder->reset(encoder);
+                reset_override(enc->mode);
+            }
+            break;
+
+        case Encoder_MPG:
+        case Encoder_MPG_X:
+        case Encoder_MPG_Y:
+        case Encoder_MPG_Z:
+#ifdef A_AXIS
+        case Encoder_MPG_A:
+#endif
+#ifdef B_AXIS
+        case Encoder_MPG_B:
+#endif
+#ifdef C_AXIS
+        case Encoder_MPG_C:
+#endif
+#ifdef U_AXIS
+        case Encoder_MPG_U:
+#endif
+#ifdef V_AXIS
+        case Encoder_MPG_V:
+#endif
+#ifdef W_AXIS
+        case Encoder_MPG_W:
+#endif
+            mpg_spin_lock = true;
+            if(event.click) {;
+                mpg[enc->axis].event.scale = On;
+                mpg_event.mask |= (1 << enc->axis);
+            }
+            if(event.dbl_click) {
+                mpg[enc->axis].event.zero = On;
+                mpg_event.mask |= (1 << enc->axis);
+            }
+            mpg_spin_lock = false;
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void encoder_rt_report(stream_write_ptr stream_write, report_tracking_flags_t report)
+{
+    if(override_encoder && report.encoder) {
+        stream_write("|Enc:");
+        stream_write(uitoa(override_encoder->mode));
+    }
+
+    if(on_realtime_report)
+        on_realtime_report(stream_write, report);
+}
+
+static bool encoder_bind (my_encoder_t *enc, encoder_t *encoder)
+{
+    uint_fast8_t idx = 0;
+
+    override_encoder = NULL;
+
+    enc->axis = 0xFF;
+    enc->encoder = encoder;
+
+    encoder_cfg_t cfg = {
+        .dbl_click_window = enc->settings->dbl_click_window,
+        .vel_timeout = enc->settings->mode >= Encoder_MPG ? QEI_VELOCITY_TIMEOUT : 0
+    };
+
+    encoder->configure(encoder, &cfg);
+
+    switch((enc->mode = enc->settings->mode)) {
+
+        case Encoder_Universal:
+            enc->mode = Encoder_FeedRate;
+            override_encoder = enc;
+            break;
+
+        case Encoder_MPG:
+            {
+                uint_fast8_t i;
+                enc->axis = X_AXIS;
+                for(i = 0; i < N_AXIS; i++)
+                    mpg[idx].enc = enc;
+                has_mpg_encoder = true;
+            }
+            break;
+
+        case Encoder_MPG_X:
+            enc->axis = X_AXIS;
+            mpg[X_AXIS].enc = enc;
+            has_mpg_encoder = true;
+            break;
+
+        case Encoder_MPG_Y:
+            enc->axis = Y_AXIS;
+            mpg[Y_AXIS].enc = enc;
+            has_mpg_encoder = true;
+            break;
+
+        case Encoder_MPG_Z:
+            enc->axis = Z_AXIS;
+            mpg[Z_AXIS].enc = enc;
+            has_mpg_encoder = true;
+            break;
+#ifdef A_AXIS
+        case Encoder_MPG_A:
+            enc->axis = A_AXIS;
+            mpg[A_AXIS].enc = enc;
+            has_mpg_encoder = true;
+            break;
+#endif
+#ifdef B_AXIS
+        case Encoder_MPG_B:
+            enc->axis = B_AXIS;
+            mpg[B_AXIS].enc = enc;
+            has_mpg_encoder = true;
+            break;
+#endif
+#ifdef C_AXIS
+        case Encoder_MPG_C:
+            enc->axis = C_AXIS;
+            mpg[C_AXIS].enc = enc;
+            has_mpg_encoder = true;
+            break;
+#endif
+#ifdef U_AXIS
+        case Encoder_MPG_U:
+            enc->axis = U_AXIS;
+            mpg[U_AXIS].enc = enc;
+            has_mpg_encoder = true;
+            break;
+#endif
+#ifdef V_AXIS
+        case Encoder_MPG_V:
+            enc->axis = V_AXIS;
+            mpg[V_AXIS].enc = enc;
+            has_mpg_encoder = true;
+            break;
+#endif
+#ifdef W_AXIS
+        case Encoder_MPG_W:
+            enc->axis = W_AXIS;
+            mpg[W_AXIS].enc = enc;
+            has_mpg_encoder = true;
+            break;
+#endif
+        default:
+            break;
+    }
+
+    encoder->reset(encoder);
+
+    for(idx = 0; idx < N_AXIS; idx++) {
+        mpg[idx].scale_factor = 1.0f;
+//        mpg[idx].handler = mpg_move_absolute;
+        mpg[idx].handler = mpg_jog_relative;
+    }
+
+#if COMPATIBILITY_LEVEL <= 1
+    if(override_encoder) {
+        if(on_realtime_report == NULL) {
+            on_realtime_report = grbl.on_realtime_report;
+            grbl.on_realtime_report = encoder_rt_report;
+        }
+    } else if(on_realtime_report) {
+        grbl.on_realtime_report = encoder_rt_report;
+        on_realtime_report = grbl.on_realtime_report;
+    }
+#endif
+
+    task_delete(encoder_poll, NULL);
+
+    if(has_mpg_encoder)
+        task_add_systick(encoder_poll, NULL);
+
+    return true;
+}
+
+// Claim "simple" encoders (bidirectional and with select button when available)
+static bool encoder_claim (encoder_t *encoder, void *data)
+{
+    static const encoder_caps_t caps = { .bidirectional = On, .select = On };
+
+    if((encoder->caps.mask & caps.mask) && !(encoder->caps.mask & ~caps.mask) && encoder->claim(encoder, encoder_event, &enc[n_encoder])) {
+        enc->settings = &encoders[n_encoder];
+        encoder_bind(&enc[n_encoder++], encoder);
+    }
+
+    return true;
+}
+
+// Settings handling
+
+static encoder_setting_id_t normalize_id (setting_id_t setting, uint_fast16_t *idx)
+{
+    uint_fast16_t base_idx = (uint_fast16_t)setting - (uint_fast16_t)Setting_EncoderSettingsBase;
+    uint_fast8_t setting_idx = base_idx % ENCODER_SETTINGS_INCREMENT;
+    *idx = (base_idx - setting_idx) / ENCODER_SETTINGS_INCREMENT;
+
+    return (encoder_setting_id_t)setting_idx;
+}
+
+// Store encoder configuration.
+static status_code_t encoder_set_value (setting_id_t setting, uint_fast16_t value)
+{
+    uint_fast16_t idx;
+    status_code_t status = Status_OK;
+
+    setting = normalize_id(setting, &idx);
+
+    if(idx < n_encoder) {
+
+        switch((encoder_setting_id_t)setting) {
+
+            case Setting_EncoderMode:
+                if(value < Encoder_Spindle_Position)
+                    encoders[idx].mode = (encoder_mode_t)value;
+                else
+                    status = Status_InvalidStatement;
+                break;
+
+            case Setting_EncoderCPR:
+                encoders[idx].cpr = (uint32_t)value;
+                break;
+
+            case Setting_EncoderCPD:
+                encoders[idx].cpd = (uint32_t)value;
+                break;
+
+            case Setting_EncoderDblClickWindow:
+                if(isintf(value) && value != NAN && value >= 100.0f && value <= 900.0f)
+                    encoders[idx].dbl_click_window = (uint32_t)value;
+                else
+                    status = Status_InvalidStatement;
+                break;
+
+            default:
+                status = Status_Unhandled;
+                break;
+        }
+
+        encoder_cfg_t cfg = {
+            .dbl_click_window = encoders[idx].dbl_click_window,
+            .vel_timeout = encoders[idx].mode >= Encoder_MPG ? QEI_VELOCITY_TIMEOUT : 0
+        };
+
+        enc[idx].encoder->configure(enc[idx].encoder, &cfg);
+    }
+
+    return status;
+}
+
+// Report encoder configuration. Encoder numbering sequence set by n_encoder define.
+static uint32_t encoder_get_value (setting_id_t setting)
+{
+    uint_fast16_t value = 0, idx;
+
+    setting = normalize_id(setting, &idx);
+
+    if(idx < n_encoder) switch((encoder_setting_id_t)setting) {
+
+        case Setting_EncoderMode:
+            value = (uint32_t)encoders[idx].mode;
+            break;
+
+        case Setting_EncoderCPR:
+            value = encoders[idx].cpr;
+            break;
+
+        case Setting_EncoderCPD:
+            value = encoders[idx].cpd;
+            break;
+
+        case Setting_EncoderDblClickWindow:
+            value = encoders[idx].dbl_click_window;
+            break;
+
+        default:
+            break;
+    }
+
+    return value;
+}
+
+static bool encoder_group_available (const setting_group_detail_t *group)
+{
+    return group->id < Group_Encoder0 + QEI_ENABLE;
+}
+
+#define ESET_OPTS { .subgroups = On, .increment = ENCODER_SETTINGS_INCREMENT }
+
+static const setting_group_detail_t encoder_groups [] = {
+    { Group_Root, Group_Encoders, "Encoders"},
+    { Group_Encoders, Group_Encoder0, "Encoder 1", encoder_group_available },
+    { Group_Encoders, Group_Encoder1, "Encoder 2", encoder_group_available },
+    { Group_Encoders, Group_Encoder2, "Encoder 3", encoder_group_available },
+    { Group_Encoders, Group_Encoder3, "Encoder 4", encoder_group_available },
+    { Group_Encoders, Group_Encoder4, "Encoder 5", encoder_group_available }
+};
+
+static const setting_detail_t encoder_settings[] = {
+    { Setting_EncoderModeBase, Group_Encoder0, "Encoder ? mode", NULL, Format_RadioButtons, "Universal,Feed rate override,Rapid rate override,Spindle RPM override", NULL, NULL, Setting_NonCoreFn, encoder_set_value, encoder_get_value, NULL, ESET_OPTS },
+    { Setting_EncoderCPRBase, Group_Encoder0, "Encoder ? counts per revolution", NULL, Format_Integer, "###0", "1", NULL, Setting_NonCoreFn, encoder_set_value, encoder_get_value, NULL, ESET_OPTS },
+    { Setting_EncoderCPDBase, Group_Encoder0, "Encoder ? counts per detent", NULL, Format_Integer, "#0", "1", NULL, Setting_NonCoreFn, encoder_set_value, encoder_get_value, NULL, ESET_OPTS },
+    { Setting_EncoderDblClickWindowBase, Group_Encoder0, "Encoder ? double click sensitivity", "ms", Format_Integer, "##0", "100", "900", Setting_NonCoreFn, encoder_set_value, encoder_get_value, NULL, ESET_OPTS }
+};
+
+static void encoder_settings_save (void)
+{
+    hal.nvs.memcpy_to_nvs(nvs_address, (uint8_t *)&encoders, sizeof(encoders), true);
+}
+
+static void encoder_settings_restore (void)
+{
+    uint_fast8_t idx;
+
+    for(idx = 0; idx < QEI_ENABLE; idx++) {
+        encoders[idx].mode = Encoder_Universal;
+        encoders[idx].cpr = 400;
+        encoders[idx].cpd = 4;
+        encoders[idx].dbl_click_window = 500; // ms
+    }
+
+    encoder_settings_save();
+}
+
+static void encoder_settings_load (void)
+{
+    if(hal.nvs.memcpy_from_nvs((uint8_t *)&encoders, nvs_address, sizeof(encoders), true) != NVS_TransferResult_OK)
+        encoder_settings_restore();
+
+    encoders_enumerate(encoder_claim, NULL);
+}
+
+static bool encoder_settings_iterator (const setting_detail_t *setting, setting_output_ptr callback, void *data)
+{
+    uint_fast16_t idx, instance;
+
+    normalize_id(setting->id, &instance);
+
+    for(idx = 0; idx < QEI_ENABLE; idx++)
+        callback(setting, idx * ENCODER_SETTINGS_INCREMENT + instance, data);
+
+    return true;
+}
+
+//
+
+static void onReportOptions (bool newopt)
+{
+    on_report_options(newopt);
+
+    if(!newopt)
+        report_plugin("ENCODER", "0.11");
+}
+
+bool encoder_init (void)
+{
+    static setting_details_t settings_details = {
+        .groups = encoder_groups,
+        .n_groups = QEI_ENABLE + 1,
+        .settings = encoder_settings,
+        .n_settings = sizeof(encoder_settings) / sizeof(setting_detail_t),
+        .save = encoder_settings_save,
+        .load = encoder_settings_load,
+        .restore = encoder_settings_restore,
+        .iterator = encoder_settings_iterator
+    };
+
+    if((nvs_address = nvs_alloc(sizeof(encoders)))) {
+
+        settings_register(&settings_details);
+
+        on_report_options = grbl.on_report_options;
+        grbl.on_report_options = onReportOptions;
+    }
+
+    return nvs_address != 0;
+}
+
+#endif // QEI_ENABLE
